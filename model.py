@@ -1,3 +1,4 @@
+
 import jax 
 from jax import numpy as jnp
 import chex
@@ -34,9 +35,10 @@ class DQNTrainingArgs:
     # bigger that the batch size but it can be an arbitrarily small positive number
     train_intensity: float = 8.0
 
+
 class DQN(nn.Module):
-    n_actions: int
-    state_shape: list[int]
+    n_actions: int # Number of possible actions
+    state_shape: list[int] # Hidden layer size
     
     @nn.compact
     def __call__(self, state: '[batch, *state_shape]') -> '[batch, n_actions]':
@@ -51,18 +53,15 @@ class DQN(nn.Module):
         Returns:
             array containing Q-values for each action, its shape is [batch, n_actions]
         """
-        batch = state.shape[0]
-                
         x = nn.Dense(128)(state)
         x = nn.relu(x)
-        
-        x = nn.Dense(64)(x)
+        x = nn.Dense(128)(x)
         x = nn.relu(x)
         
-        q_values = jnp.zeros((batch, self.n_actions), dtype=jnp.float32)
+        # Output layer to produce Q-values for each action
+        q_values = nn.Dense(self.n_actions)(x)  # Final layer that outputs Q-values
 
         return q_values
-
 
 DQNParameters = flax.core.frozen_dict.FrozenDict
 
@@ -99,61 +98,69 @@ class DQNAgent:
 
 
 def select_action(dqn: DQN, rng: chex.PRNGKey, params: DQNParameters, state: chex.Array, epsilon: chex.Array) -> chex.Array:
-    random_value = jax.random.uniform(rng)
-    
-    random_action = jax.random.randint(rng, shape=(), minval=0, maxval=dqn.n_actions)
-    
-    q_values = dqn.apply(params, state)  # Forward pass to get Q-values
-    greedy_action = jnp.argmax(q_values, axis=-1)
-    
-    action = jnp.where(random_value < epsilon, random_action, greedy_action)
-    return jnp.array(action, dtype=jnp.int32)
-
-
+   
+    key, subkey, subkey2 = jax.random.split(rng, 3)
+    greedy_prob = jax.random.uniform(subkey, shape=(), minval=0, maxval=1)
+   
+    q_values = dqn.apply(params, state)
+    rand_arm = jax.random.choice(subkey2, a = dqn.n_actions)
+    argmax_arm = jnp.argmax(q_values, axis=-1)
+   
+    action = jnp.where(greedy_prob<epsilon,
+                       rand_arm,
+                       argmax_arm) 
+   
+    return action
 
 def compute_loss(dqn: DQN, params: DQNParameters, target_params: DQNParameters, transition: Transition, gamma: float) -> chex.Array:
+    
     state, action, reward, done, next_state = transition
-    
-    q_values = dqn.apply(params, state)  
-    
-    next_q_values = dqn.apply(target_params, next_state) 
-    
-    q_value = q_values[action] 
-    
-    max_next_q_value = jnp.max(next_q_values)  
 
-    target_value = reward + gamma * (1 - done) * max_next_q_value  
+    q_values = dqn.apply(params, state)
+    q_value = q_values[action]
+
+    target_q_values = dqn.apply(target_params, next_state)
+    max_target_q_value = jnp.max(target_q_values)
+
+    target_q_value = reward + gamma * (1 - done) * max_target_q_value
     
-    loss = jnp.square(q_value - target_value) 
+    loss = jnp.square(q_value - target_q_value)
     
     return loss
 
 
 def update_target(state: DQNTrainState) -> DQNTrainState:
-    state = state.replace(target_params = state.params)
-    new_state = state
+    
+    state = state.replace(target_params=state.params)
+    new_state = state # Assign the updated state to new_state
+    
     return new_state
 
 
 def initialize_agent_state(dqn: DQN, rng: chex.PRNGKey, args: DQNTrainingArgs) -> DQNTrainState:
     
     if not hasattr(args, "state_shape"):
+        # Define a default if state_shape is not present in args
         args.state_shape = (4,)  # Assuming CartPole environment; adjust as needed
 
-    ini_state = jnp.zeros((1, *args.state_shape), dtype=jnp.float32)
-    params = dqn.init(rng, ini_state)
+    dummy_state = jnp.zeros((1, *args.state_shape), dtype=jnp.float32)
+    # Initialize the neural network parameters using the provided state shape
+    params = dqn.init(rng, dummy_state)
 
+    # Set up the optimizer using optax
     optimizer = optax.adam(learning_rate=args.learning_rate)
 
+    # Create the DQN training state with parameters and target parameters initialized as a copy of params
     train_state = DQNTrainState.create(
         apply_fn=dqn.apply,
         params=params,
-        target_params=params,  
+        target_params=params,  # Target network initialized as a copy of the main network parameters
         tx=optimizer,
     )
 
     return train_state
 
+# we are using cartpole dqn so we can fix the sizes
 dqn = DQN(n_actions=2, state_shape=(4,))
 SimpleDQNAgent = DQNAgent(
     dqn=dqn,
@@ -165,22 +172,23 @@ SimpleDQNAgent = DQNAgent(
 
 
 def compute_loss_double_dqn(dqn: DQN, params: DQNParameters, target_params: DQNParameters, transition: Transition, gamma: float) -> chex.Array:
+    
     state, action, reward, done, next_state = transition
-    
-    q_values = dqn.apply(params, state)
-    q_value = jnp.take_along_axis(q_values, action, axis=-1).squeeze()
-    
-    next_q_values = dqn.apply(params, next_state)
-    best_next_action = jnp.argmax(next_q_values, axis=-1)
-    
-    target_q_values = dqn.apply(target_params, next_state)
-    target_q_value = jnp.take_along_axis(target_q_values, best_next_action[..., None], axis=-1).squeeze()
-    
-    td_target = reward + gamma * target_q_value * (1.0 - done)
-    
-    loss = jnp.square(td_target - q_value).mean()
-    return loss
 
+    q_values = dqn.apply(params, state)
+    q_value = q_values[action]
+
+    next_q_values = dqn.apply(params, next_state)  # Get Q-values for next state with main DQN
+    best_next_action = jnp.argmax(next_q_values)  # Select the action with the highest Q-value
+
+    target_q_values = dqn.apply(target_params, next_state)
+    target_q_value = target_q_values[best_next_action]
+
+    target = reward + gamma * (1 - done) * target_q_value
+
+    loss = jnp.square(q_value - target)
+
+    return loss
 
 DoubleDQNAgent = DQNAgent(
     dqn=dqn,
